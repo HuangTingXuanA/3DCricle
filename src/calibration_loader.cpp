@@ -91,7 +91,7 @@ bool loadCalibration(const std::string& yamlPath, StereoParams& params) {
         }
         
         // 计算基础矩阵
-        params.computeFundamentalMatrix();
+        params.init();
         
         fs.release();
         

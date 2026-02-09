@@ -65,7 +65,7 @@ cv::Mat drawEllipses(const cv::Mat& image, const std::vector<Ellipse>& ellipses)
 // ============================================================================
 
 void saveReconstructResults(const std::string& outputPath,
-                            const std::vector<stereo::OptimizeResult>& results,
+                            const std::vector<stereo::ReconstructionResult>& results,
                             const std::string& imageName) {
     cv::FileStorage fs(outputPath, cv::FileStorage::WRITE);
     if (!fs.isOpened()) {
@@ -88,8 +88,8 @@ void saveReconstructResults(const std::string& outputPath,
         fs << "normal_y" << res.circle.normal.y();
         fs << "normal_z" << res.circle.normal.z();
         fs << "radius" << res.circle.radius;
-        fs << "reproj_error_L" << res.reprojErrorL;
-        fs << "reproj_error_R" << res.reprojErrorR;
+        fs << "error" << res.reprojError;
+        fs << "score" << res.score;
         fs << "}";
     }
     fs << "]";
@@ -98,21 +98,35 @@ void saveReconstructResults(const std::string& outputPath,
 }
 
 void saveEdgePointsPLY(const std::string& outputPath,
-                        const std::vector<stereo::OptimizeResult>& results) {
+                        const std::vector<stereo::ReconstructionResult>& results) {
     std::ofstream ofs(outputPath);
     if (!ofs.is_open()) {
         std::cerr << "[Error] 无法创建PLY文件: " << outputPath << std::endl;
         return;
     }
     
-    int totalPoints = 0;
-    for (const auto& res : results) {
-        totalPoints += (int)res.edgePoints.size();
+    int pointsPerCircle = 100;
+    std::vector<Eigen::Vector3d> allPoints;
+    std::vector<std::tuple<int, int, int>> pointColors;
+
+    std::vector<std::tuple<int, int, int>> colors = {
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
+        {255, 255, 0}, {255, 0, 255}, {0, 255, 255}
+    };
+    
+    for (size_t i = 0; i < results.size(); ++i) {
+        auto pts = stereo::sampleCircleEdgePoints(results[i].circle, pointsPerCircle);
+        auto color = colors[i % colors.size()];
+        
+        for (const auto& p : pts) {
+            allPoints.push_back(p);
+            pointColors.push_back(color);
+        }
     }
     
     ofs << "ply\n";
     ofs << "format ascii 1.0\n";
-    ofs << "element vertex " << totalPoints << "\n";
+    ofs << "element vertex " << allPoints.size() << "\n";
     ofs << "property float x\n";
     ofs << "property float y\n";
     ofs << "property float z\n";
@@ -121,18 +135,12 @@ void saveEdgePointsPLY(const std::string& outputPath,
     ofs << "property uchar blue\n";
     ofs << "end_header\n";
     
-    std::vector<std::tuple<int, int, int>> colors = {
-        {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
-        {255, 255, 0}, {255, 0, 255}, {0, 255, 255}
-    };
-    
-    for (size_t i = 0; i < results.size(); ++i) {
-        auto [r, g, b] = colors[i % colors.size()];
-        for (const auto& pt : results[i].edgePoints) {
-            ofs << std::fixed << std::setprecision(6)
-                << pt.x() << " " << pt.y() << " " << pt.z() << " "
-                << r << " " << g << " " << b << "\n";
-        }
+    for (size_t i = 0; i < allPoints.size(); ++i) {
+        auto& pt = allPoints[i];
+        auto& col = pointColors[i];
+        ofs << std::fixed << std::setprecision(6)
+            << pt.x() << " " << pt.y() << " " << pt.z() << " "
+            << std::get<0>(col) << " " << std::get<1>(col) << " " << std::get<2>(col) << "\n";
     }
     
     ofs.close();
@@ -144,7 +152,7 @@ void saveEdgePointsPLY(const std::string& outputPath,
 
 cv::Mat drawReprojection(const cv::Mat& image,
                           const std::vector<Ellipse>& detectedEllipses,
-                          const std::vector<stereo::OptimizeResult>& results,
+                          const std::vector<stereo::ReconstructionResult>& results,
                           const stereo::StereoParams& stereo,
                           bool isLeft) {
     cv::Mat display;
@@ -163,14 +171,13 @@ cv::Mat drawReprojection(const cv::Mat& image,
     }
     
     // 绘制重投影椭圆 (红色)
-    Eigen::Matrix<double, 3, 4> P = isLeft ? stereo.getProjectionMatrixL() 
-                                           : stereo.getProjectionMatrixR();
+    Eigen::Matrix<double, 3, 4> P = isLeft ? stereo.P_L : stereo.P_R;
     Eigen::Matrix3d K = isLeft ? stereo.K_L : stereo.K_R;
     
     for (const auto& res : results) {
-        if (!res.valid) continue;
+        if (!res.valid()) continue;
         
-        Ellipse proj = stereo::projectCircleToEllipse(res.circle, K, P);
+        Ellipse proj = stereo::projectCircle(res.circle, K, P);
         cv::ellipse(display,
                     cv::Point(cvRound(proj.center.x), cvRound(proj.center.y)),
                     cv::Size(cvRound(proj.a), cvRound(proj.b)),
@@ -188,7 +195,7 @@ cv::Mat drawReprojection(const cv::Mat& image,
 // ============================================================================
 
 void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debug) {
-    std::cout << "\n========== 3D圆重建模式 ==========\n";
+    std::cout << "\n========== 3D圆重建模式 (Refactored) ==========\n";
     std::cout << "输入目录: " << inputDir << std::endl;
     
     fs::path basePath(inputDir);
@@ -212,6 +219,7 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
         std::cerr << "[Error] 标定文件加载失败" << std::endl;
         return;
     }
+    stereoParams.init(); // 重要：初始化导出参数 P_L, P_R, F
     
     // 收集左图像文件
     std::vector<std::string> leftImages;
@@ -239,11 +247,14 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
     
     // 初始化优化器
     stereo::OptimizerParams optParams;
+    // 可以根据需要调整 optParams
     stereo::CircleOptimizer optimizer(stereoParams, optParams);
     
     // 检测参数
     DetectorParams detParams;
     detParams.debug = debug;
+    // 确保检测足够敏感以产生候选项
+    detParams.ellipse.minEllipseScore1 = 0.4; 
     
     // 显示窗口
     std::string windowName = "3D重建结果";
@@ -287,8 +298,8 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
                   << " 右=" << ellipsesR.size() << std::endl;
         
         // 3D重建
-        std::vector<stereo::OptimizeResult> results = 
-            optimizer.reconstructAll(ellipsesL, ellipsesR);
+        std::vector<stereo::ReconstructionResult> results = 
+            optimizer.reconstruct(ellipsesL, ellipsesR);
         
         auto endTime = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double, std::milli>(endTime - startTime).count();
@@ -302,8 +313,7 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
                       << std::setprecision(2) << res.circle.center.x() << ", "
                       << res.circle.center.y() << ", " << res.circle.center.z()
                       << ") R=" << res.circle.radius << " mm"
-                      << " 误差L=" << std::setprecision(3) << res.reprojErrorL 
-                      << " 误差R=" << res.reprojErrorR << " px" << std::endl;
+                      << " Score=" << std::setprecision(3) << res.score << std::endl;
         }
         
         totalCircles += (int)results.size();
@@ -328,13 +338,14 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
             info << imgName << " | Circles: " << results.size() 
                  << " | Time: " << std::fixed << std::setprecision(1) << elapsed << "ms";
             cv::putText(combined, info.str(), cv::Point(10, 25),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-            cv::putText(combined, "Green=Detected, Red=Reprojected", cv::Point(10, 45),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
+                        cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 255), 2);
+            cv::putText(combined, "Green=Detected, Red=Reprojected", cv::Point(10, 55),
+                        cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 255), 2);
             
             fs::path visPath = resultsDir / (fs::path(imgName).stem().string() + "_vis.png");
             cv::imwrite(visPath.string(), combined);
             
+            cv::resizeWindow(windowName, combined.size());
             cv::imshow(windowName, combined);
             int key = cv::waitKey(500);
             if (key == 27) break;
@@ -358,7 +369,7 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
 // ============================================================================
 
 void printUsage(const char* progName) {
-    std::cout << "3D圆重建程序\n" << std::endl;
+    std::cout << "3D圆重建程序 (Refactored)\n" << std::endl;
     std::cout << "用法: " << progName << " -f <目录> [选项]\n" << std::endl;
     std::cout << "参数:" << std::endl;
     std::cout << "  -f, --folder <路径>  指定包含 left/, right/, calibration.yaml 的目录" << std::endl;
