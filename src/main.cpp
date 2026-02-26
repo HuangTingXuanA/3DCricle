@@ -13,6 +13,7 @@
 #include "stereo_geometry.h"
 #include "circle_optimizer.h"
 #include "calibration_loader.h"
+#include <opencv2/core/eigen.hpp>
 
 namespace fs = std::filesystem;
 
@@ -290,9 +291,20 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
         
         auto startTime = std::chrono::high_resolution_clock::now();
         
-        // 椭圆检测
-        std::vector<Ellipse> ellipsesL = detectEllipses(imageL, detParams);
-        std::vector<Ellipse> ellipsesR = detectEllipses(imageR, detParams);
+        // 在无畸变的相机模型下进行极线约束与几何重建
+        cv::Mat cvK_L, cvD_L, cvK_R, cvD_R;
+        cv::eigen2cv(stereoParams.K_L, cvK_L);
+        cv::eigen2cv(stereoParams.dist_L, cvD_L);
+        cv::eigen2cv(stereoParams.K_R, cvK_R);
+        cv::eigen2cv(stereoParams.dist_R, cvD_R);
+        
+        cv::Mat undistL, undistR;
+        cv::undistort(imageL, undistL, cvK_L, cvD_L);
+        cv::undistort(imageR, undistR, cvK_R, cvD_R);
+        
+        // 椭圆检测 (在去畸变的图像上检测)
+        std::vector<Ellipse> ellipsesL = detectEllipses(undistL, detParams);
+        std::vector<Ellipse> ellipsesR = detectEllipses(undistR, detParams);
         
         std::cout << "  检测椭圆: 左=" << ellipsesL.size() 
                   << " 右=" << ellipsesR.size() << std::endl;
@@ -328,8 +340,8 @@ void reconstruct3DCircles(const std::string& inputDir, bool visualize, bool debu
         
         // 可视化
         if (visualize) {
-            cv::Mat visL = drawReprojection(imageL, ellipsesL, results, stereoParams, true);
-            cv::Mat visR = drawReprojection(imageR, ellipsesR, results, stereoParams, false);
+            cv::Mat visL = drawReprojection(undistL, ellipsesL, results, stereoParams, true);
+            cv::Mat visR = drawReprojection(undistR, ellipsesR, results, stereoParams, false);
             
             cv::Mat combined;
             cv::hconcat(visL, visR, combined);
